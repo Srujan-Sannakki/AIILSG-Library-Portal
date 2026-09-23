@@ -25,3 +25,11 @@ dist-ssr
 .env
 server/.env
 cloud.env
+.env.*
+!.env.example
+!server/.env.example
+server/private-files/
+server/uploads/
+playwright-report/
+test-results/
+._*
