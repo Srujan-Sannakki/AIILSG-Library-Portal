@@ -1,0 +1,28 @@
+// Disposable, local-only UI verification. Never use these fixtures against a real database.
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { randomBytes } from 'node:crypto';
+import bcrypt from 'bcryptjs';
+import { PDFDocument } from 'pdf-lib';
+const mongo=await MongoMemoryReplSet.create({replSet:{count:1}});
+const dir=await mkdtemp(path.join(os.tmpdir(),'aiilsg-preview-'));
+Object.assign(process.env,{NODE_ENV:'test',MONGO_URI:mongo.getUri(),JWT_SECRET:randomBytes(48).toString('hex'),CLIENT_ORIGIN:'http://127.0.0.1:5173',PRIVATE_STORAGE_DIR:dir,STORAGE_DRIVER:'local'});
+const {connectDB}=await import('../config/db.js'); await connectDB();
+const {app}=await import('../app.js');
+const mongoose=(await import('mongoose')).default;
+await Promise.all(Object.values(mongoose.models).map(model=>model.init()));
+const User=(await import('../models/User.js')).default;
+const Admin=(await import('../models/Admin.js')).default;
+const Book=(await import('../models/Book.js')).default;
+const Inventory=(await import('../models/Inventory.js')).default;
+const hash=await bcrypt.hash('Preview-only-12345',12);
+await Admin.create([{id:'preview-admin',name:'Preview Administrator',password:hash,role:'super_admin',isCore:true},{id:'preview-librarian',name:'Preview Librarian',password:hash,role:'limited_admin'}]);
+await User.create({sid:'111111111111111',name:'Preview Student',password:hash,totalFee:100,paidAmount:50,validFrom:'2020-01-01',validUntil:'2099-12-31',academicYear:'2026',access:['preview-book']});
+const pdf=await PDFDocument.create();pdf.addPage().drawText('AIILSG - Authorized page one');pdf.addPage().drawText('Page two requires full entitlement');
+const storage=await (await import('../services/storage.js')).storePdf(Buffer.from(await pdf.save()));
+await Book.create({customId:'preview-book',title:'Preview Library Guide',totalPages:2,...storage});
+await Inventory.create({itemId:'preview-stock',name:'Printed guide',type:'Book',openingStock:5,currentStock:5,price:100});
+const server=app.listen(5000,'127.0.0.1',()=>console.log('Disposable preview ready on port 5000. Accounts: preview-admin, preview-librarian, 111111111111111. Password: Preview-only-12345'));
+for(const signal of ['SIGTERM','SIGINT'])process.on(signal,async()=>{server.close();await mongoose.disconnect();await mongo.stop();await rm(dir,{recursive:true,force:true});process.exit(0);});

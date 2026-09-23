@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import SecureReader from './components/SecureReader';
 import { createPortal } from 'react-dom';
 import * as API from './api'; 
 import { 
@@ -12,16 +13,13 @@ import {
   UserPlus, UserMinus, ShieldAlert, MapPin, Phone, Mail, ArrowRight
 } from 'lucide-react';
 
-const SERVER_URL = 'http://127.0.0.1:5000'; 
+
 
 // --- DATE VALIDITY CHECKER ---
 const isAccessValid = (user) => {
-  if (!user.validFrom || !user.validUntil) return true; 
-  const now = new Date();
-  const start = new Date(user.validFrom);
-  const end = new Date(user.validUntil);
-  end.setHours(23, 59, 59, 999);
-  return now >= start && now <= end;
+  if (!user.validFrom || !user.validUntil) return false;
+  const today = new Date().toISOString().slice(0,10);
+  return today >= user.validFrom && today <= user.validUntil;
 };
 
 // --- LOGO COMPONENT ---
@@ -102,7 +100,10 @@ export default function App() {
   const [visitors, setVisitors] = useState([]); 
   const [inventory, setInventory] = useState([]);
   const [transactions, setTransactions] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const [pages, setPages] = useState({});
+  const generation = useRef(0);
     
   const [settings, setSettings] = useState({
     announcement: 'Welcome to the new academic session.',
@@ -119,164 +120,97 @@ export default function App() {
     return () => { clearTimeout(exitTimer); clearTimeout(removeTimer); };
   }, []);
 
-  // --- FETCH DATA FROM SERVER ON LOAD ---
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        setLoading(true);
-        console.log("Fetching initial data...");
-        
-        // Helper to fetch safely without crashing entire app if one fails
-        const fetchSafely = (promise, name) => promise
-            .then(res => res.data)
-            .catch(err => {
-                console.warn(`Failed to fetch ${name}:`, err.message);
-                return []; 
-            });
-
-        const [usersData, booksData, invData, txData, visData, adminsData, settingsData, logsData] = await Promise.all([
-          fetchSafely(API.fetchUsers(), 'Users'),
-          fetchSafely(API.fetchBooks(), 'Books'),
-          fetchSafely(API.fetchInventory(), 'Inventory'),
-          fetchSafely(API.fetchTransactions(), 'Transactions'),
-          fetchSafely(API.fetchVisitors(), 'Visitors'),
-          fetchSafely(API.fetchAdmins(), 'Admins'),
-          fetchSafely(API.fetchSettings(), 'Settings'),
-          fetchSafely(API.fetchLogs(), 'Logs')
-        ]);
-
-        if (usersData.length > 0) setUsers(usersData);
-        if (booksData.length > 0) setBooks(booksData);
-        if (invData.length > 0) setInventory(invData);
-        if (txData.length > 0) setTransactions(txData);
-        if (visData.length > 0) setVisitors(visData);
-        if (adminsData.length > 0) setAdmins(adminsData);
-        if (settingsData && Object.keys(settingsData).length > 0) setSettings(settingsData);
-        if (logsData.length > 0) setLogs(logsData);
-        
-        console.log(`✅ Loaded ${usersData.length} users, ${booksData.length} books, ${adminsData.length} admins`);
-      } catch (error) {
-        console.error("Critical error in data fetch:", error);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchData();
+  const clearSession = useCallback(() => {
+    generation.current += 1;
+    setSettings({announcement:'Welcome to the library.',watermarkText:'AIILSG',maintenanceMode:false,adminNote:''});
+    API.setToken(null);
+    setCurrentUser(null); setCurrentAdmin(null); setView('login');
+    setUsers([]); setBooks([]); setAdmins([]); setInventory([]);
+    setTransactions([]); setVisitors([]); setReports([]); setLogs([]); setPages({});
+    setLoading(false);
   }, []);
+  const acceptAccount = useCallback(account => {
+    if (account.role === 'student') { setCurrentUser(account); setCurrentAdmin(null); setView('student'); }
+    else { setCurrentAdmin(account); setCurrentUser(null); setView('admin'); }
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    const expired = () => { clearSession(); setLoadError('Your session expired. Please log in again.'); };
+    window.addEventListener('auth-expired', expired);
+    if (API.getToken()) API.me().then(({data}) => { if (!cancelled) acceptAccount(data); }).catch(e => { if (!cancelled) setLoadError(API.errorMessage(e)); });
+    return () => { cancelled = true; window.removeEventListener('auth-expired', expired); };
+  }, [acceptAccount, clearSession]);
 
-  const addLog = async (action, details) => {
-    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const newLog = { time, action, details };
-    setLogs(prev => [newLog, ...prev]);
-    
-    // Save to backend
+  const accountId = currentUser?._id || currentAdmin?._id;
+  const accountRole = currentUser?.role || currentAdmin?.role;
+  const loadData = useCallback(async () => {
+    if (!accountId) return;
+    const run = ++generation.current;
+    setLoading(true); setLoadError('');
+    const lists = { books: [API.fetchBooks, setBooks] };
+    if (accountRole !== 'student') Object.assign(lists, { users: [API.fetchUsers, setUsers], inventory: [API.fetchInventory, setInventory], transactions: [API.fetchTransactions, setTransactions], visitors: [API.fetchVisitors, setVisitors], reports: [API.fetchReports, setReports] });
+    if (accountRole === 'super_admin') Object.assign(lists, { admins: [API.fetchAdmins, setAdmins], logs: [API.fetchLogs, setLogs] });
     try {
-      await API.createLog(newLog);
-    } catch (error) {
-      console.error("Failed to save log to backend:", error);
-    }
-  };
-
-  const handleReportIssue = (userId, context, issue) => {
-    const newReport = {
-      id: Date.now(),
-      userId,
-      context,
-      issue,
-      status: 'Pending',
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    };
-    setReports(prev => [newReport, ...prev]);
-    addLog('User Report', `New report from ${userId}`);
-  };
-
-  const updateReport = (id, field, value) => {
-    setReports(prev => prev.map(r => r.id === id ? { ...r, [field]: value } : r));
-  };
-
-  const toggleReportStatus = (reportId) => {
-    setReports(prev => prev.map(r => r.id === reportId ? { ...r, status: r.status === 'Pending' ? 'Resolved' : 'Pending' } : r));
-  };
-
-  // --- LOGIN LOGIC ---
-  const handleLogin = async (id, pass) => {
-    if (!id || !pass) {
-      alert("Please enter both ID and password.");
-      return;
-    }
-
+      const [settingsResponse, meResponse] = await Promise.all([API.fetchSettings(), API.me()]);
+      const responses = await Promise.all(Object.entries(lists).map(async ([key, [fetcher, setter]]) => ({ key, setter, data: (await fetcher({limit:50,offset:0})).data })));
+      if (run !== generation.current) return;
+      setSettings(settingsResponse.data);
+      if (accountRole === 'student') setCurrentUser(meResponse.data);
+      const nextPages = {};
+      for (const {key,setter,data} of responses) { setter(data.items); nextPages[key] = {offset:data.items.length,total:data.total}; }
+      setPages(nextPages);
+    } catch (e) { if (run === generation.current) setLoadError(API.errorMessage(e)); }
+    finally { if (run === generation.current) setLoading(false); }
+  }, [accountId, accountRole]);
+  useEffect(() => { loadData(); return () => { generation.current += 1; }; }, [loadData]);
+  const loadMore = async () => {
+    const run = generation.current;
+    const lists = { books:[API.fetchBooks,setBooks], users:[API.fetchUsers,setUsers], inventory:[API.fetchInventory,setInventory], transactions:[API.fetchTransactions,setTransactions], visitors:[API.fetchVisitors,setVisitors], reports:[API.fetchReports,setReports], admins:[API.fetchAdmins,setAdmins], logs:[API.fetchLogs,setLogs] };
+    setLoading(true);
     try {
-        console.log("🔐 Attempting login for:", id);
-        const response = await API.login({ id, password: pass });
-        const data = response.data;
-        console.log("📥 Login response:", data);
-
-        if (data.success) {
-            // Store JWT token
-            if (data.token) {
-                localStorage.setItem('token', data.token);
-                console.log("✅ Token stored in localStorage");
-            }
-            
-            // Check Role - admins have role 'super_admin' or 'limited_admin'
-            if (data.user.role === 'super_admin' || data.user.role === 'limited_admin') {
-                setCurrentAdmin(data.user);
-                setView('admin');
-                addLog('Admin Login', `${data.user.name} logged in`);
-            } else {
-                // Check maintenance mode for students
-                if (settings.maintenanceMode) {
-                  alert("System is currently under maintenance. Please contact Admin.");
-                  // Clear token if maintenance mode blocks login
-                  localStorage.removeItem('token');
-                  return;
-                }
-                setCurrentUser(data.user);
-                setView('student');
-                addLog('User Login', `${data.user.name} logged in`);
-            }
-        } else {
-            alert("Login failed: " + (data.error || "Invalid credentials"));
-        }
-    } catch (error) {
-        console.error("❌ Login error:", error);
-        console.error("Error details:", {
-          message: error.message,
-          response: error.response?.data,
-          status: error.response?.status,
-          statusText: error.response?.statusText
-        });
-        
-        if (error.code === 'ECONNREFUSED' || error.message.includes('Network Error')) {
-          alert("Cannot connect to server. Please ensure the server is running on port 5000.");
-        } else {
-          alert("Login failed: " + (error.response?.data?.error || error.message || "Invalid Credentials or Server Error"));
-        }
+      for (const [key, state] of Object.entries(pages)) {
+        if (state.offset >= state.total) continue;
+        const [fetcher,setter] = lists[key];
+        const {data} = await fetcher({offset:state.offset,limit:50});
+        if (run !== generation.current) return;
+        setter(previous => [...new Map([...previous,...data.items].map(item=>[item._id,item])).values()]);
+        setPages(previous => ({...previous,[key]:{offset:state.offset+data.items.length,total:data.total}}));
+      }
+    } catch(e) { setLoadError(API.errorMessage(e)); }
+    finally { if (run === generation.current) setLoading(false); }
+  };
+  // Mutations are audited by the backend. Refresh the read-only audit view after success.
+  const addLog = async () => {
+    if (accountRole === 'super_admin') {
+      try { const {data}=await API.fetchLogs({limit:50}); setLogs(data.items); } catch { /* Main action already succeeded. */ }
     }
   };
-
-  const logout = () => {
-    setCurrentUser(null);
-    setCurrentAdmin(null);
-    setView('login');
-    localStorage.removeItem('token'); 
+  const handleReportIssue = async (_userId, context, issue) => {
+    try { const {data}=await API.createReport({context,issue}); setReports(prev=>[data,...prev]); alert('Report submitted.'); }
+    catch(e) { alert(API.errorMessage(e)); }
   };
-
-  const changePassword = (userId, newPass) => {
-    setUsers(prev => prev.map(u => u.id === userId || u.sid === userId ? { ...u, password: newPass } : u));
-    addLog('Password Change', `User ${userId} updated their password (Session Only)`);
-    alert("Password updated locally (API endpoint needed for persistence)!");
+  const updateReport = async (id, field, value) => {
+    try { const {data}=await API.updateReport(id,{[field]:value}); setReports(prev=>prev.map(r=>r.id===id?data:r)); }
+    catch(e) { alert(API.errorMessage(e)); }
   };
-
-  const resetPassword = (userId, newPass) => {
-    const userExists = users.some(u => u.id === userId || u.sid === userId);
-    if (userExists) {
-      setUsers(prev => prev.map(u => u.id === userId || u.sid === userId ? { ...u, password: newPass } : u));
-      addLog('Password Reset', `Password reset for ${userId}`);
-      return true;
-    }
-    return false;
+  const toggleReportStatus = id => {
+    const report=reports.find(r=>r.id===id);
+    if(report) return updateReport(id,'status',report.status==='Pending'?'Resolved':'Pending');
+  };
+  const handleLogin = async (id, password) => {
+    if (!id || !password) return setLoadError('Enter your ID and password.');
+    setLoading(true); setLoadError('');
+    try { const {data}=await API.login({id,password}); API.setToken(data.token); acceptAccount(data.user); }
+    catch(e) { setLoadError(API.errorMessage(e)); }
+    finally { setLoading(false); }
+  };
+  const logout = async () => {
+    try { await API.logout(); clearSession(); }
+    catch(e) { alert(API.errorMessage(e)); }
+  };
+  const changePassword = async (id, newPassword, currentPassword) => {
+    try { await API.changePassword(id,{newPassword,currentPassword}); clearSession(); alert('Password changed. Please log in again.'); return true; }
+    catch(e) { alert(API.errorMessage(e)); return false; }
   };
 
   return (
@@ -295,6 +229,11 @@ export default function App() {
           </div>
       )}
 
+      {loadError && <div role="alert" className="relative z-40 p-4 bg-red-50 text-red-800 border-b">{loadError} {accountId && <button className="underline ml-3" onClick={loadData}>Retry</button>}</div>}
+      {accountId && <div className="p-3 bg-blue-50 text-blue-900 text-sm flex flex-wrap justify-center gap-4">
+        <button onClick={loadData} disabled={loading} className="underline">Refresh records</button>
+        {Object.values(pages).some(p=>p.offset<p.total) && <><span>More records are available. Exports include loaded records only.</span><button onClick={loadMore} disabled={loading} className="font-bold underline">Load more records</button></>}
+      </div>}
       {/* MAIN APP CONTAINER */}
       <div 
         className={`h-full w-full transition-all duration-[1000ms] ease-[cubic-bezier(0.7,0,0.3,1)] ${splashState === 'visible' ? 'scale-95 opacity-0' : 'scale-100 opacity-100'}`}
@@ -303,24 +242,9 @@ export default function App() {
           <div className="animate-[fadeIn_0.5s_ease-out_forwards]">
               <LoginScreen 
               onLogin={handleLogin} 
-              onResetPassword={resetPassword} 
+
               maintenanceMode={settings.maintenanceMode} 
-              onEnquiry={(data) => {
-                  const newReport = {
-                  id: Date.now(),
-                  userId: `${data.name} (${data.phone})`,
-                  context: 'Public Enquiry',
-                  issue: data.message,
-                  date: data.date,
-                  purpose: data.purpose,
-                  officer: '',
-                  designation: '',
-                  status: 'Pending',
-                  time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                  };
-                  setReports(prev => [newReport, ...prev]);
-                  addLog('Public Enquiry', `New enquiry from ${data.name}`);
-              }}
+              onEnquiry={API.createEnquiry}
               />
           </div>
         }
@@ -396,11 +320,11 @@ export default function App() {
 // ==========================================
 // 2. LOGIN SCREEN
 // ==========================================
-function LoginScreen({ onLogin, onResetPassword, maintenanceMode, onEnquiry }) {
+function LoginScreen({ onLogin, maintenanceMode, onEnquiry }) {
   const [id, setId] = useState('');
   const [pass, setPass] = useState('');
   const [isResetMode, setIsResetMode] = useState(false);
-  const [newResetPass, setNewResetPass] = useState('');
+
   
   const [showEnquiry, setShowEnquiry] = useState(false);
   const [enquiryData, setEnquiryData] = useState({ 
@@ -411,25 +335,9 @@ function LoginScreen({ onLogin, onResetPassword, maintenanceMode, onEnquiry }) {
     message: '' 
   });
 
-  const handleResetSubmit = () => {
-    if (!id || !newResetPass) {
-      alert("Please enter SID and new password.");
-      return;
-    }
-    const success = onResetPassword(id, newResetPass);
-    if (success) {
-      alert("Password reset successful!");
-      setIsResetMode(false);
-      setPass(''); 
-      setNewResetPass('');
-    } else {
-      alert("SID not found.");
-    }
-  };
-
-  const handleEnquirySubmit = () => {
+  const handleEnquirySubmit = async () => {
     if(!enquiryData.name || !enquiryData.phone || !enquiryData.message || !enquiryData.purpose) return alert("Please fill all fields");
-    onEnquiry(enquiryData);
+    try { await onEnquiry(enquiryData); } catch(e) { alert(API.errorMessage(e)); return; }
     alert("Enquiry sent successfully! Admin will contact you.");
     setShowEnquiry(false);
     setEnquiryData({ 
@@ -457,7 +365,7 @@ function LoginScreen({ onLogin, onResetPassword, maintenanceMode, onEnquiry }) {
             {isResetMode ? "Reset Password" : "AIILSG Portal"}
           </h1>
           <p className="text-slate-500 text-sm mt-2">
-            {isResetMode ? "Verify SID to create new password" : "Authorized Access Only"}
+            {isResetMode ? "Contact your librarian to verify your identity and reset your password." : "Authorized Access Only"}
           </p>
         </div>
 
@@ -476,18 +384,7 @@ function LoginScreen({ onLogin, onResetPassword, maintenanceMode, onEnquiry }) {
         )}
         
         {isResetMode ? (
-          <div className="space-y-5">
-             <div>
-              <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-1.5 ml-1">Student ID (SID)</label>
-              <input type="text" value={id} onChange={e => setId(e.target.value)} className="w-full p-3 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-600 focus:border-transparent outline-none transition-all placeholder:text-slate-300 font-medium text-slate-700" placeholder="15 Digit SID" />
-            </div>
-            <div>
-              <label className="block text-xs font-bold text-slate-500 uppercase tracking-wide mb-1.5 ml-1">New Password</label>
-              <input type="password" value={newResetPass} onChange={e => setNewResetPass(e.target.value)} className="w-full p-3 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-600 focus:border-transparent outline-none transition-all placeholder:text-slate-300 font-medium text-slate-700" placeholder="Enter new password" />
-            </div>
-            <button onClick={handleResetSubmit} className="w-full bg-blue-700 hover:bg-blue-800 text-white py-3 rounded-lg font-bold text-sm shadow-md transition-all duration-200">Update Password</button>
-            <button onClick={() => setIsResetMode(false)} className="w-full text-slate-500 text-sm py-2 hover:text-slate-800 font-medium transition-colors">Back to Login</button>
-          </div>
+          <div className="space-y-5"><p className="text-sm text-slate-600">A Student ID alone cannot verify your identity. Your librarian can help recover access.</p><button onClick={() => setIsResetMode(false)} className="w-full text-blue-700 py-3">Back to Login</button></div>
         ) : (
           <div className="space-y-5">
             <div>
@@ -505,14 +402,7 @@ function LoginScreen({ onLogin, onResetPassword, maintenanceMode, onEnquiry }) {
               Authenticate & Login
             </button>
             
-            <div className="mt-8 pt-6 border-t border-slate-100 text-center">
-              <span className="text-[10px] font-bold text-slate-400 bg-slate-50 border border-slate-100 px-3 py-1 rounded-full uppercase tracking-wider">Demo Credentials</span>
-              <div className="text-xs text-slate-500 mt-4 space-y-2 font-medium">
-                <p>Full Admin: <span className="font-mono bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded text-slate-600">admin</span> / <span className="font-mono bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded text-slate-600">admin</span></p>
-                <p>Librarian: <span className="font-mono bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded text-slate-600">librarian</span> / <span className="font-mono bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded text-slate-600">lib</span></p>
-                <p>Student: <span className="font-mono bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded text-slate-600">122010620230039</span> / <span className="font-mono bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded text-slate-600">123</span></p>
-              </div>
-            </div>
+
           </div>
         )}
       </div>
@@ -576,7 +466,7 @@ function LoginScreen({ onLogin, onResetPassword, maintenanceMode, onEnquiry }) {
 function AdminPanel({ 
   currentAdmin, admins, setAdmins, users, setUsers, 
   books, setBooks, inventory, setInventory, transactions, setTransactions,
-  logs, addLog, setLogs, reports, toggleReportStatus, updateReport, 
+  logs, addLog, reports, toggleReportStatus, updateReport,
   visitors, setVisitors, settings, setSettings, onLogout 
 }) {
   const isSuperAdmin = currentAdmin?.role === 'super_admin';
@@ -585,9 +475,6 @@ function AdminPanel({
   const [reportSubTab, setReportSubTab] = useState('users');
   
   const [viewYear, setViewYear] = useState(new Date().getFullYear().toString());
-  const [reportType, setReportType] = useState('monthly');
-  const [reportDate, setReportDate] = useState(new Date().toISOString().slice(0, 7));
-  const [reportYear, setReportYear] = useState(new Date().getFullYear().toString());
   const [visitorRepType, setVisitorRepType] = useState('daily');
   const [visitorRepDate, setVisitorRepDate] = useState(new Date().toISOString().split('T')[0]);
   const [visitorRepMonth, setVisitorRepMonth] = useState(new Date().toISOString().slice(0, 7));
@@ -600,7 +487,7 @@ function AdminPanel({
   });
   const [accessModalBook, setAccessModalBook] = useState(null);
   const [newUser, setNewUser] = useState({ 
-    id: '', name: '', password: '123', totalFee: 10000,
+    id: '', name: '', password: '', totalFee: 10000,
     admissionCycle: 'June', admissionYear: new Date().getFullYear().toString(),
     phone: '', course: '', center: '', dob: '', medium: 'English'
   });
@@ -611,6 +498,13 @@ function AdminPanel({
   const [isUploading, setIsUploading] = useState(false);
 
   // NEW STATES FOR STOCK MODULE
+  const [newStock, setNewStock] = useState({itemId:'',name:'',type:'Book',price:0,openingStock:0,minStock:10});
+  const [savingStock,setSavingStock] = useState(false);
+  const addStock = async event => {
+    event.preventDefault(); if(savingStock) return; setSavingStock(true);
+    try { const {data}=await API.createInventory(newStock); setInventory(prev=>[data,...prev]); setNewStock({itemId:'',name:'',type:'Book',price:0,openingStock:0,minStock:10}); addLog(); }
+    catch(e) { alert(API.errorMessage(e)); } finally { setSavingStock(false); }
+  };
   const [stockSearch, setStockSearch] = useState('');
   const [showTransModal, setShowTransModal] = useState(false);
   const [showLedgerModal, setShowLedgerModal] = useState(null); // stores item ID
@@ -633,12 +527,12 @@ function AdminPanel({
     const totalIn = itemTrans.filter(t => t.type === 'RECEIPT').reduce((acc, t) => acc + Number(t.quantity), 0);
     const totalOut = itemTrans.filter(t => t.type === 'ISSUE').reduce((acc, t) => acc + Number(t.quantity), 0);
     
-    const current = (item.openingStock || 0) + totalIn - totalOut;
+    const current = item.currentStock ?? 0;
     return { 
       current, 
       value: current * (item.price || 0),
-      totalIn,
-      totalOut
+      totalIn: item.totalIn ?? totalIn,
+      totalOut: item.totalOut ?? totalOut
     };
   };
 
@@ -648,16 +542,17 @@ function AdminPanel({
     
     const stats = getStockStats(transForm.itemId);
     if(transForm.type === 'ISSUE' && stats.current < transForm.quantity) {
-      if(!confirm(`Warning: Stock will become negative (${stats.current - transForm.quantity}). Continue?`)) return;
+      return alert('Insufficient stock. Refresh records if stock was recently received.');
     }
 
     try {
         const { data } = await API.createTransaction({
             ...transForm,
-            user: currentAdmin.name
+            quantity: Number(transForm.quantity)
         });
         
         setTransactions(prev => [data, ...prev]);
+        setInventory(prev=>prev.map(item=>item.itemId===data.inventory.itemId?data.inventory:item));
         addLog('Stock Transaction', `${transForm.type} - ${transForm.quantity} items`);
         setShowTransModal(false);
         setTransForm({ ...transForm, quantity: 1, particular: '', itemId: '' }); 
@@ -763,17 +658,20 @@ function AdminPanel({
     }
   };
 
-  const updateUserFee = (userId, value) => {
-    setUsers(prev => prev.map(u => u.id === userId || u.sid === userId ? { ...u, paidAmount: Number(value) } : u));
-    addLog('Fee Update', `Updated fee for ${userId} to ${value}`);
+  const pendingAccess = useRef(new Set());
+  const replaceUser = data => setUsers(previous => previous.map(u => u._id === data._id ? data : u));
+  const updateUserFee = async (userId, value) => {
+    try { const {data}=await API.updateFees(userId,{paidAmount:Number(value)}); replaceUser(data); addLog(); return true; }
+    catch(e) { alert(API.errorMessage(e)); return false; }
   };
-
-  const toggleAccess = (userId, bookId) => {
-    setUsers(prev => prev.map(u => {
-      if (u.id !== userId && u.sid !== userId) return u;
-      const hasAccess = u.access.includes(bookId);
-      return { ...u, access: hasAccess ? u.access.filter(id => id !== bookId) : [...u.access, bookId] };
-    }));
+  const toggleAccess = async (userId, bookId) => {
+    const user = users.find(u => u.sid === userId || u._id === userId);
+    if(!user || pendingAccess.current.has(userId)) return;
+    pendingAccess.current.add(userId);
+    const access=user.access.includes(bookId)?user.access.filter(id=>id!==bookId):[...user.access,bookId];
+    try { const {data}=await API.updatePermissions(userId,{access}); replaceUser(data); addLog(); }
+    catch(e) { alert(API.errorMessage(e)); }
+    finally { pendingAccess.current.delete(userId); }
   };
 
   const addUser = async () => {
@@ -794,22 +692,19 @@ function AdminPanel({
     }
 
     const userToAdd = {
-        sid: newUser.id,
-        ...newUser,
-        paidAmount: 0,
-        access: [],
-        validFrom: vFrom,
-        validUntil: vUntil,
-        academicYear: batchStr
+      sid:newUser.id,name:newUser.name,password:newUser.password,phone:newUser.phone,
+      totalFee:Number(newUser.totalFee),paidAmount:0,access:[],validFrom:vFrom,validUntil:vUntil,academicYear:batchStr,
+      ...(newUser.course?{course:newUser.course}:{}),...(newUser.center?{center:newUser.center}:{}),
+      ...(newUser.medium?{medium:newUser.medium}:{}),...(newUser.dob?{dob:newUser.dob}:{})
     };
-    
+
     try {
         const { data } = await API.createUser(userToAdd);
         setUsers(prev => [...prev, data]);
         addLog('Create User', `Created ${newUser.name} (${newUser.id})`);
         
         setNewUser({ 
-            id: '', name: '', password: '123', totalFee: 10000, 
+            id: '', name: '', password: '', totalFee: 10000,
             admissionCycle: 'June',
             admissionYear: new Date().getFullYear().toString(),
             phone: '', course: '', center: '', dob: '', medium: 'English'
@@ -839,19 +734,16 @@ function AdminPanel({
     addLog('Export', 'Downloaded User Database');
   };
 
-  const deleteUser = (userId) => {
-    if (window.confirm(`Delete user ${userId}?`)) {
-      setUsers(prev => prev.filter(u => u.id !== userId && u.sid !== userId));
-      addLog('Delete User', `Deleted user ${userId}`);
-    }
+  const deleteUser = async userId => {
+    if (!window.confirm(`Delete user ${userId}?`)) return;
+    try { await API.deleteUser(userId); setUsers(prev=>prev.filter(u=>u.sid!==userId && u._id!==userId)); addLog(); }
+    catch(e) { alert(API.errorMessage(e)); }
   };
-
-  const adminResetPass = (userId) => {
-    const newPass = prompt("Enter new password:", "123456");
-    if (newPass) {
-      setUsers(prev => prev.map(u => u.id === userId || u.sid === userId ? { ...u, password: newPass } : u));
-      addLog('Admin Password Reset', `Reset password for ${userId}`);
-    }
+  const adminResetPass = async userId => {
+    const newPassword=prompt('Enter a new password (12–72 characters):');
+    if (!newPassword) return;
+    try { await API.resetPassword(userId,newPassword); alert('Password reset and all existing sessions revoked.'); addLog(); }
+    catch(e) { alert(API.errorMessage(e)); }
   };
 
   const handleFileSelect = (e) => {
@@ -860,7 +752,7 @@ function AdminPanel({
   };
 
   const addBook = async () => {
-    if (!newBookTitle || !newBookPages) return alert("Please enter details.");
+    if (!newBookTitle || !fileInputRef.current?.files[0]) return alert("Please enter details.");
     
     const file = fileInputRef.current?.files[0];
     const formData = new FormData();
@@ -869,8 +761,8 @@ function AdminPanel({
     formData.append('customId', `b${Date.now()}`);
 
     if (file) {
-      if (file.size > 100 * 1024 * 1024) { 
-        alert("File too large. Max 100MB allowed.");
+      if (file.size > 20 * 1024 * 1024) {
+        alert("File too large. Max 20MB allowed.");
         return;
       }
       formData.append('pdf', file);
@@ -895,7 +787,7 @@ function AdminPanel({
 
   const deleteBook = async (bookId, title) => {
     if (window.confirm(`Delete book "${title}"?`)) {
-      setBooks(prev => prev.filter(b => b.id !== bookId && b.customId !== bookId));
+      try { await API.deleteBook(bookId); setBooks(prev => prev.filter(b => b.customId !== bookId)); } catch(e) { alert(API.errorMessage(e)); return; }
       addLog('Delete Book', `Deleted book "${title}"`);
     }
   };
@@ -970,18 +862,6 @@ function AdminPanel({
     }
   };
 
-  const clearLogs = async () => {
-    if (!window.confirm("Clear all logs?")) return;
-    
-    try {
-      await API.clearLogs();
-      setLogs([]);
-      addLog('System', 'All logs cleared');
-    } catch (error) {
-      alert("Failed to clear logs: " + (error.response?.data?.error || error.message));
-    }
-  };
-
   const filteredUsers = users.filter(u => u.academicYear && u.academicYear.includes(viewYear));
   const userReports = reports.filter(r => r.context !== 'Public Enquiry');
   const publicReports = reports.filter(r => r.context === 'Public Enquiry');
@@ -1022,7 +902,7 @@ function AdminPanel({
                  {currentAdmin.name} 
                  <span className="ml-1 opacity-50">({isSuperAdmin ? 'Full' : 'Limited'})</span>
               </span>
-              <button onClick={onLogout} className="text-xs bg-white text-red-600 border border-red-200 hover:bg-red-50 px-4 py-2 rounded font-bold transition-all">LOGOUT</button>
+              <button aria-label="Log out" onClick={onLogout} className="text-xs bg-white text-red-600 border border-red-200 hover:bg-red-50 px-4 py-2 rounded font-bold transition-all">LOGOUT</button>
             </div>
           </div>
         </div>
@@ -1088,6 +968,7 @@ function AdminPanel({
                   <input type="number" value={newUser.totalFee} onChange={e => setNewUser({...newUser, totalFee: Number(e.target.value)})} className="w-full border p-2 rounded text-sm focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none" />
                 </div>
                 
+                <div className="md:col-span-4"><label className="block text-xs font-bold">Initial password (12–72 characters)<input aria-label="Initial student password" type="password" minLength={12} maxLength={72} value={newUser.password} onChange={e=>setNewUser({...newUser,password:e.target.value})} className="block w-full border p-2 rounded" /></label></div>
                 <div className="md:col-span-12 mt-2">
                   <button onClick={addUser} className="w-full bg-slate-800 text-white p-2.5 rounded font-bold hover:bg-slate-700 flex items-center justify-center text-sm shadow-sm transition-all hover:scale-[1.01]">
                     <Save className="w-4 h-4 mr-2" /> Save User (Auto-Generates Valid Dates)
@@ -1127,7 +1008,7 @@ function AdminPanel({
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-sm">
                   {filteredUsers.length > 0 ? filteredUsers.map((user, index) => {
-                    const percent = Math.round((user.paidAmount / user.totalFee) * 100);
+                    const percent = Math.round(user.totalFee === 0 ? 100 : Math.max(0, Math.min(100, (user.paidAmount / user.totalFee) * 100)));
                     return (
                       <tr key={user._id || user.id} className="hover:bg-slate-50 transition-colors group animate-[slideUpFade_0.3s_ease-out_forwards]" style={{animationDelay: `${index * 50}ms`, opacity: 0}}>
                         <td className="p-4 align-top">
@@ -1145,7 +1026,7 @@ function AdminPanel({
                         <td className="p-4 align-top">
                           <div className="flex items-center space-x-2 mb-1">
                              <span className="font-bold text-slate-400">₹</span>
-                             <input type="number" value={user.paidAmount} onChange={(e) => updateUserFee(user.id || user.sid, e.target.value)} className="w-20 border border-slate-200 p-1 rounded font-bold text-slate-800 focus:border-blue-500 outline-none text-right bg-white text-xs" />
+                             <input type="number" key={user.paidAmount} defaultValue={user.paidAmount} aria-label={`Paid amount for ${user.name}`} onBlur={async (e) => { const input=e.currentTarget; if (Number(input.value) !== user.paidAmount && !await updateUserFee(user.sid, input.value)) input.value=user.paidAmount; }} className="w-20 border border-slate-200 p-1 rounded font-bold text-slate-800 focus:border-blue-500 outline-none text-right bg-white text-xs" />
                              <span className="text-xs text-slate-400">/ {user.totalFee}</span>
                           </div>
                           <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden mb-1">
@@ -1189,7 +1070,7 @@ function AdminPanel({
               </h3>
               <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-end bg-blue-50 p-4 rounded-lg border border-blue-100">
                 <div className="md:col-span-5">
-                  <label className="text-[10px] font-bold text-slate-500 uppercase mb-1 block">Select PDF (Max 100MB)</label>
+                  <label className="text-[10px] font-bold text-slate-500 uppercase mb-1 block">Select PDF (Max 20MB)</label>
                   <input type="file" accept="application/pdf" ref={fileInputRef} onChange={handleFileSelect} className="w-full text-xs file:mr-4 file:py-1.5 file:px-3 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-white file:text-blue-700 hover:file:bg-blue-50 cursor-pointer text-slate-500" />
                 </div>
                  <div className="md:col-span-4">
@@ -1485,8 +1366,8 @@ function AdminPanel({
                                     type="text" 
                                     className="border border-slate-200 bg-white rounded p-1.5 text-xs w-32 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all shadow-sm" 
                                     placeholder="Officer Name"
-                                    value={report.officer || ''}
-                                    onChange={(e) => updateReport(report.id, 'officer', e.target.value)}
+                                    key={report.officer || ''} defaultValue={report.officer || ''}
+                                    onBlur={(e) => updateReport(report.id, 'officer', e.target.value)}
                                 />
                             </td>
                             <td className="p-4">
@@ -1494,8 +1375,8 @@ function AdminPanel({
                                     type="text" 
                                     className="border border-slate-200 bg-white rounded p-1.5 text-xs w-32 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none transition-all shadow-sm" 
                                     placeholder="Designation"
-                                    value={report.designation || ''}
-                                    onChange={(e) => updateReport(report.id, 'designation', e.target.value)}
+                                    key={report.designation || ''} defaultValue={report.designation || ''}
+                                    onBlur={(e) => updateReport(report.id, 'designation', e.target.value)}
                                 />
                             </td>
                           </>
@@ -1544,6 +1425,12 @@ function AdminPanel({
         {activeTab === 'physical_library' && isSuperAdmin && (
           <div className="space-y-6 animate-[slideUpFade_0.4s_ease-out]">
             
+            <form onSubmit={addStock} className="p-5 bg-white rounded-xl border grid grid-cols-2 md:grid-cols-6 gap-3">
+              <h3 className="col-span-2 md:col-span-6 font-bold">Add inventory item</h3>
+              {['itemId','name','type'].map(key=><label key={key} className="text-xs font-bold">{key === 'itemId' ? 'Item ID' : key}<input required value={newStock[key]} onChange={e=>setNewStock({...newStock,[key]:e.target.value})} className="block w-full border rounded p-2 font-normal" /></label>)}
+              {['price','openingStock','minStock'].map(key=><label key={key} className="text-xs font-bold">{key}<input type="number" min="0" step={key==='price'?'0.01':'1'} required value={newStock[key]} onChange={e=>setNewStock({...newStock,[key]:Number(e.target.value)})} className="block w-full border rounded p-2 font-normal" /></label>)}
+              <button disabled={savingStock} className="col-span-2 bg-blue-700 text-white rounded p-2">{savingStock?'Saving…':'Add item'}</button>
+            </form>
             {/* MODULE 1: STOCK DASHBOARD */}
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
               <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
@@ -1864,16 +1751,9 @@ function AdminPanel({
                   <h3 className="text-lg font-bold text-slate-800 flex items-center mb-3">
                     <Settings className="w-5 h-5 mr-3 text-slate-400" /> Data Management
                   </h3>
-                  <p className="text-xs text-slate-500 leading-relaxed">Download system backup or clear audit trails.</p>
+                  <p className="text-xs text-slate-500 leading-relaxed">Audit history is retained on the server. Database backups are managed through your hosting provider.</p>
                 </div>
-                <div className="flex space-x-3 mt-6">
-                  <button onClick={() => alert("Backup downloaded (simulated)")} className="flex-1 py-3 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700 flex items-center justify-center transition-all shadow-sm uppercase tracking-wider">
-                    <Download className="w-3 h-3 mr-2" /> Backup Data
-                  </button>
-                  <button onClick={clearLogs} className="flex-1 py-3 bg-white text-slate-600 rounded-lg text-xs font-bold hover:bg-slate-50 border border-slate-200 transition-colors uppercase tracking-wider">
-                    Clear Logs
-                  </button>
-                </div>
+                <p className="mt-6 text-xs text-slate-600">Audit records cannot be edited or cleared through the portal.</p>
               </div>
             </div>
 
@@ -1897,12 +1777,12 @@ function AdminPanel({
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div>
                   <label className="text-[10px] font-bold text-slate-500 uppercase block mb-2 tracking-widest">Watermark Text</label>
-                  <input type="text" value={settings.watermarkText} onChange={e => updateSetting('watermarkText', e.target.value)} className="w-full border border-slate-200 p-3 rounded-lg text-sm focus:ring-2 focus:ring-purple-500/20 outline-none transition-all text-slate-700"/>
+                  <input type="text" key={settings.watermarkText} defaultValue={settings.watermarkText} onBlur={e => updateSetting('watermarkText', e.target.value)} className="w-full border border-slate-200 p-3 rounded-lg text-sm focus:ring-2 focus:ring-purple-500/20 outline-none transition-all text-slate-700"/>
                   <p className="text-[10px] text-slate-400 mt-1">Visible overlay on all protected documents.</p>
                 </div>
                 <div>
                   <label className="text-[10px] font-bold text-slate-500 uppercase block mb-2 tracking-widest">Admin Sticky Note</label>
-                  <input type="text" value={settings.adminNote} onChange={e => updateSetting('adminNote', e.target.value)} className="w-full border border-slate-200 p-3 rounded-lg text-sm focus:ring-2 focus:ring-purple-500/20 outline-none transition-all text-slate-700" placeholder="e.g. Read Chapter 4"/>
+                  <input type="text" key={settings.adminNote} defaultValue={settings.adminNote} onBlur={e => updateSetting('adminNote', e.target.value)} className="w-full border border-slate-200 p-3 rounded-lg text-sm focus:ring-2 focus:ring-purple-500/20 outline-none transition-all text-slate-700" placeholder="e.g. Read Chapter 4"/>
                   <p className="text-[10px] text-slate-400 mt-1">Internal note for admins.</p>
                 </div>
               </div>
@@ -1940,6 +1820,7 @@ function StudentPortal({ user, allBooks, settings, darkMode, setDarkMode, onLogo
   const [showProfile, setShowProfile] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [newPass, setNewPass] = useState('');
+  const [currentPassword, setCurrentPassword] = useState('');
   const [searchTerm, setSearchTerm] = useState('');
   const [settingsTab, setSettingsTab] = useState('profile');
 
@@ -1998,7 +1879,7 @@ function StudentPortal({ user, allBooks, settings, darkMode, setDarkMode, onLogo
               </div>
               
               <div className="relative">
-                  <button onClick={() => setShowProfile(true)} className={`p-2 rounded-full transition ${darkMode ? 'hover:bg-slate-700 text-slate-300' : 'hover:bg-slate-100 text-slate-500'}`}>
+                  <button aria-label="Open profile" onClick={() => setShowProfile(true)} className={`p-2 rounded-full transition ${darkMode ? 'hover:bg-slate-700 text-slate-300' : 'hover:bg-slate-100 text-slate-500'}`}>
                     <User className="w-5 h-5" />
                   </button>
               </div>
@@ -2034,7 +1915,7 @@ function StudentPortal({ user, allBooks, settings, darkMode, setDarkMode, onLogo
                   </nav>
                   
                   <div className="mt-auto pt-6 border-t border-slate-200/20">
-                      <button onClick={onLogout} className="w-full flex items-center justify-center px-4 py-3 rounded-lg bg-red-50 text-red-600 font-bold hover:bg-red-100 transition-colors text-sm">
+                      <button aria-label="Log out" onClick={onLogout} className="w-full flex items-center justify-center px-4 py-3 rounded-lg bg-red-50 text-red-600 font-bold hover:bg-red-100 transition-colors text-sm">
                           <LogOut className="w-4 h-4 mr-2"/> Log Out
                       </button>
                   </div>
@@ -2127,7 +2008,7 @@ function StudentPortal({ user, allBooks, settings, darkMode, setDarkMode, onLogo
                           <h2 className="text-2xl font-bold mb-6">Security Settings</h2>
                           <div className="space-y-4">
                               <div>
-                                <label className="text-sm font-bold opacity-70 mb-2 block">New Password</label>
+                                <label className="text-sm font-bold block mb-2">Current password<input aria-label="Current password" type="password" value={currentPassword} onChange={e=>setCurrentPassword(e.target.value)} className="block w-full border rounded p-3 text-slate-900" /></label><label className="text-sm font-bold opacity-70 mb-2 block">New Password</label>
                                 <input 
                                   type="password" 
                                   value={newPass} 
@@ -2137,10 +2018,9 @@ function StudentPortal({ user, allBooks, settings, darkMode, setDarkMode, onLogo
                                 />
                               </div>
                               <button 
-                                onClick={() => { 
+                                onClick={async () => {
                                    if(!newPass) return alert("Please enter a password");
-                                   onChangePassword(user.id || user.sid, newPass); 
-                                   setNewPass(''); 
+                                   if(await onChangePassword(user.sid, newPass, currentPassword)) { setNewPass(''); setCurrentPassword(''); }
                                 }} 
                                 className="w-full bg-blue-600 text-white font-bold py-3 rounded-lg hover:bg-blue-700 shadow-md transition-all mt-4"
                               >
@@ -2169,7 +2049,7 @@ function StudentPortal({ user, allBooks, settings, darkMode, setDarkMode, onLogo
                 <Info className="w-4 h-4 mr-2 text-blue-500" /> How to use this portal
               </h2>
               <p className="text-sm mb-4">
-                This help is fully text-based to protect your privacy. Support will never ask you to send screenshots or screen recordings from this portal.
+                When contacting support, share only the details needed to explain your issue. Avoid sharing passwords or personal information.
               </p>
               <div className="space-y-3 text-sm">
                 <div>
@@ -2181,8 +2061,8 @@ function StudentPortal({ user, allBooks, settings, darkMode, setDarkMode, onLogo
                   <p>Go to &quot;Assigned Books&quot; and click a title to open it. Pages unlock based on your fee payment status. Use the arrows at the bottom to change pages.</p>
                 </div>
                 <div>
-                  <h3 className="font-semibold">3. Reporting an issue (without screenshots)</h3>
-                  <p>Use the red &quot;REPORT&quot; button on the dashboard or the flag button inside the reader. Describe the issue in words (page number, book name, and what went wrong). Do not send photos, screenshots or recordings.</p>
+                  <h3 className="font-semibold">3. Reporting an issue</h3>
+                  <p>Use the red &quot;REPORT&quot; button on the dashboard or the flag button inside the reader. Describe the issue in words (page number, book name, and what went wrong). Avoid including private student information.</p>
                 </div>
                 <div>
                   <h3 className="font-semibold">4. Changing password</h3>
@@ -2214,7 +2094,7 @@ function StudentPortal({ user, allBooks, settings, darkMode, setDarkMode, onLogo
 }
 
 function BookList({ user, announcement, filteredBooks, searchTerm, setSearchTerm, darkMode, onOpen }) {
-  const percentPaid = Math.round((user.paidAmount / user.totalFee) * 100);
+  const percentPaid = Math.round(user.totalFee === 0 ? 100 : Math.max(0, Math.min(100, (user.paidAmount / user.totalFee) * 100)));
   
   const validAccess = isAccessValid(user);
 
@@ -2316,234 +2196,4 @@ function BookList({ user, announcement, filteredBooks, searchTerm, setSearchTerm
       </div>
     </div>
   );
-}
-
-// ==========================================
-// 5. SECURE READER (WEB HARDENED - REAL SERVER)
-// ==========================================
-function SecureReader({ book, user, settings, darkMode, setDarkMode, onReportIssue, onClose }) {
-    const [pageNum, setPageNum] = useState(1);
-    const canvasRef = useRef(null);
-    const [pdfDoc, setPdfDoc] = useState(null);
-    const [zoom, setZoom] = useState(1.0);
-    const renderTaskRef = useRef(null);
-    const [isObscured, setIsObscured] = useState(false);
-    const [securityWarning, setSecurityWarning] = useState('');
-    const [isWindowFocused, setIsWindowFocused] = useState(true);
-  
-    const accessRatio = user.paidAmount / user.totalFee;
-    const maxPage = Math.floor(book.totalPages * accessRatio);
-    const isLocked = pageNum > maxPage;
-  
-    useEffect(() => {
-      const loadPdfLib = async () => {
-        if (!window.pdfjsLib) {
-          const script = document.createElement('script');
-          script.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
-          script.onload = () => {
-            window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-          };
-          document.body.appendChild(script);
-        }
-      };
-      loadPdfLib();
-    }, []);
-  
-    useEffect(() => {
-      // REAL PDF LOADING FROM SERVER OR CLOUDINARY
-      if (book.hasFile && book.filePath) {
-         const checkLib = setInterval(() => {
-          if (window.pdfjsLib) {
-            clearInterval(checkLib);
-            
-            // Determine if it's a Cloudinary URL or local path
-            let pdfUrl;
-            if (book.filePath.startsWith('http://') || book.filePath.startsWith('https://')) {
-              // Cloudinary URL or external URL - use directly
-              pdfUrl = book.filePath;
-            } else if (book.filePath.startsWith('/uploads/')) {
-              // Local path - prepend server URL
-              pdfUrl = `${SERVER_URL}${book.filePath}`;
-            } else {
-              // Legacy format - try to extract filename
-              const cleanPath = book.filePath.replace(/\\/g, '/');
-              const filename = cleanPath.split('/').pop();
-              pdfUrl = `${SERVER_URL}/uploads/${filename}`;
-            }
-
-            console.log("📄 Loading PDF from:", pdfUrl);
-            window.pdfjsLib.getDocument(pdfUrl).promise.then(doc => {
-                setPdfDoc(doc);
-            }).catch(err => {
-                console.error("Error loading PDF:", err);
-                alert("Failed to load PDF file. Please check your connection.");
-            });
-          }
-        }, 500);
-        return () => clearInterval(checkLib);
-      }
-    }, [book]);
-  
-    useEffect(() => {
-      if (pdfDoc && !isLocked) {
-        pdfDoc.getPage(pageNum).then(page => {
-          if (renderTaskRef.current) {
-            renderTaskRef.current.cancel();
-          }
-  
-          const viewport = page.getViewport({ scale: zoom * 1.5 });
-          const canvas = canvasRef.current;
-          if (canvas) {
-            const context = canvas.getContext('2d');
-            canvas.height = viewport.height;
-            canvas.width = viewport.width;
-            
-            const renderContext = {
-              canvasContext: context,
-              viewport: viewport
-            };
-            
-            const renderTask = page.render(renderContext);
-            renderTaskRef.current = renderTask;
-            
-            renderTask.promise.then(() => {
-               // Draw Watermark
-               context.save();
-               context.globalAlpha = 0.15;
-               context.font = `bold ${40 * zoom}px Arial`;
-               context.fillStyle = darkMode ? 'white' : 'black'; 
-               context.textAlign = 'center';
-               context.textBaseline = 'middle';
-               
-               const stepX = 400 * zoom;
-               const stepY = 400 * zoom;
-               
-               context.translate(canvas.width / 2, canvas.height / 2);
-               context.rotate(-Math.PI / 6);
-               context.translate(-canvas.width / 2, -canvas.height / 2);
-  
-               for(let x = -canvas.width; x < canvas.width * 2; x += stepX) {
-                  for(let y = -canvas.height; y < canvas.height * 2; y += stepY) {
-                      context.fillText(settings.watermarkText, x, y);
-                      context.fillText(user.id || user.sid, x, y + 50 * zoom);
-                  }
-               }
-               context.restore();
-  
-            }).catch(error => {
-               if (error.name !== "RenderingCancelledException") {
-                  console.error("Render error", error);
-               }
-            });
-          }
-        });
-      }
-    }, [pdfDoc, pageNum, isLocked, zoom, settings.watermarkText, user.id, user.sid, darkMode]);
-  
-    useEffect(() => {
-      const handleContext = (e) => e.preventDefault();
-      const handleKeyDown = (e) => {
-        if (e.key === 'PrintScreen' || (e.metaKey && e.shiftKey && (e.key === '3' || e.key === '4'))) {
-          e.preventDefault();
-          setIsObscured(true);
-          setSecurityWarning('Screenshots disabled');
-          setTimeout(() => { setIsObscured(false); setSecurityWarning(''); }, 2000);
-        }
-      };
-      
-      const handleFocus = () => setIsWindowFocused(true);
-      const handleBlur = () => {
-          setIsWindowFocused(false);
-          setSecurityWarning('App backgrounded - Content Hidden');
-      };
-  
-      window.addEventListener('contextmenu', handleContext);
-      window.addEventListener('keydown', handleKeyDown);
-      window.addEventListener('focus', handleFocus);
-      window.addEventListener('blur', handleBlur);
-      
-      return () => {
-        window.removeEventListener('contextmenu', handleContext);
-        window.removeEventListener('keydown', handleKeyDown);
-        window.removeEventListener('focus', handleFocus);
-        window.removeEventListener('blur', handleBlur);
-      };
-    }, []);
-  
-    return (
-      <div className={`fixed inset-0 z-50 flex flex-col ${darkMode ? 'bg-slate-900' : 'bg-slate-200'}`}>
-        
-        <style>{`
-          @media print {
-              html, body { display: none !important; }
-              * { visibility: hidden !important; }
-          }
-        `}</style>
-  
-        {isObscured && (
-          <div className="absolute inset-0 z-[100] bg-black flex flex-col items-center justify-center text-white">
-             <EyeOff className="w-24 h-24 mb-4 text-red-500" />
-             <h2 className="text-3xl font-bold">Security Violation</h2>
-          </div>
-        )}
-  
-        <div className="bg-slate-800 text-white h-16 flex justify-between items-center px-4 shadow shrink-0 z-20 relative">
-          <div className="flex items-center">
-              <button onClick={onClose} className="p-2 hover:bg-slate-700 rounded-full mr-3"><ChevronLeft /></button>
-              <div className="font-bold truncate max-w-xs">{book.title}</div>
-          </div>
-          
-          <div className="flex items-center space-x-2">
-              {securityWarning && <div className="bg-red-600 text-white px-3 py-1 rounded text-xs font-bold animate-pulse">{securityWarning}</div>}
-              
-              <div className="flex bg-slate-700 rounded mr-4">
-                  <button onClick={() => setZoom(z => Math.max(0.5, z - 0.2))} className="p-2 hover:bg-slate-600"><ZoomOut size={16}/></button>
-                  <span className="px-2 py-2 text-xs w-12 text-center">{Math.round(zoom * 100)}%</span>
-                  <button onClick={() => setZoom(z => Math.min(3.0, z + 0.2))} className="p-2 hover:bg-slate-600"><ZoomIn size={16}/></button>
-              </div>
-              
-              <button onClick={() => setDarkMode(!darkMode)} className={`p-2 rounded-full transition ${darkMode ? 'bg-slate-700 text-yellow-400' : 'bg-slate-700 text-slate-400 hover:text-white'}`}>
-               {darkMode ? <Sun className="w-5 h-5"/> : <Moon className="w-5 h-5"/>}
-              </button>
-  
-              <button onClick={() => {
-                  const issue = prompt("Describe issue with this page:");
-                  if (issue) onReportIssue(user.id || user.sid, book.title, `Page ${pageNum}: ${issue}`);
-              }} className="p-2 hover:bg-slate-600 rounded"><Flag size={18} className="text-red-400"/></button>
-              
-              <div className="text-xs bg-black/30 px-3 py-1 rounded">Page {pageNum} / {book.totalPages}</div>
-          </div>
-        </div>
-  
-        <div className="flex-1 overflow-auto flex justify-center p-0 relative">
-          <div className={`relative shadow-2xl transition-all origin-top ${darkMode ? 'bg-slate-800' : 'bg-white'}`} style={{ minHeight: '80vh', margin: '2rem' }}>
-            <div className={`relative z-10 transition-all duration-200 ${isWindowFocused ? 'blur-0 opacity-100' : 'blur-3xl opacity-0'}`}>
-              {isLocked ? (
-                <div className="flex flex-col items-center justify-center h-[80vh] w-full p-12">
-                  <Lock className="w-24 h-24 text-red-500 mb-4"/>
-                  <h2 className={`text-3xl font-bold ${darkMode ? 'text-white' : 'text-slate-800'}`}>Content Locked</h2>
-                  <p className="text-slate-500 mt-2">Pay fees to unlock this page.</p>
-                </div>
-              ) : (
-                book.hasFile ? (
-                  <canvas 
-                      ref={canvasRef} 
-                      className={`block ${darkMode ? 'invert hue-rotate-180 contrast-90' : ''}`} 
-                  />
-                ) : (
-                  <div className={`p-12 max-w-3xl whitespace-pre-wrap ${darkMode?'text-slate-300':'text-slate-900'}`}>
-                    {book.content || "No content found."}
-                  </div>
-                )
-              )}
-            </div>
-          </div>
-        </div>
-  
-        <div className="bg-slate-800 h-16 flex justify-center items-center space-x-8 shrink-0 z-30 relative shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)]">
-          <button onClick={()=>setPageNum(p=>Math.max(1, p-1))} disabled={pageNum===1} className="p-2 bg-slate-700 rounded-full text-white disabled:opacity-50"><ChevronLeft/></button>
-          <button onClick={()=>setPageNum(p=>Math.min(book.totalPages, p+1))} disabled={pageNum===book.totalPages} className="p-2 bg-slate-700 rounded-full text-white disabled:opacity-50"><ChevronRight/></button>
-        </div>
-      </div>
-    );
 }
